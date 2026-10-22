@@ -115,7 +115,6 @@
 </div>
 
 <div class="controls">
-  <button id="snapBtn">📷 Snapshot</button>
   <button id="fsBtn">⛶ Fullscreen</button>
   <button id="reloadBtn">↻ Reconnect</button>
 </div>
@@ -154,22 +153,6 @@
   });
 
   document.getElementById("reloadBtn").addEventListener("click", connect);
-
-  document.getElementById("snapBtn").addEventListener("click", () => {
-    if (!img.naturalWidth) return alert("No frame available yet.");
-    const canvas = document.createElement("canvas");
-    canvas.width = img.naturalWidth;
-    canvas.height = img.naturalHeight;
-    canvas.getContext("2d").drawImage(img, 0, 0);
-    canvas.toBlob(blob => {
-      const a = document.createElement("a");
-      const ts = new Date().toISOString().replace(/[:.]/g, "-");
-      a.href = URL.createObjectURL(blob);
-      a.download = "snapshot-" + ts + ".jpg";
-      a.click();
-      URL.revokeObjectURL(a.href);
-    }, "image/jpeg", 0.92);
-  });
 
   document.getElementById("fsBtn").addEventListener("click", () => {
     const el = document.getElementById("viewer");
