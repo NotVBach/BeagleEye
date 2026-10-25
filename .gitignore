@@ -1,0 +1,21 @@
+# CMake build folders
+build/
+build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+server/server
+*.o
+*.a
+*.so
+*.elf
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+README.md
+setup.md

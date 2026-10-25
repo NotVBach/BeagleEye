@@ -153,7 +153,6 @@ int main(int argc, char **argv) {
 
     if (bind(server, (struct sockaddr *)&addr, sizeof addr) < 0) { perror("bind"); return 1; }
     listen(server, 20);
-    printf("Open on http://<beaglebone-ip>:%d/\n", PORT);
 
     while (1) {
         int client = accept(server, NULL, NULL);
