@@ -1,4 +1,5 @@
 #include "camera.h"
+#include "vision.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,8 +21,18 @@
 #define CAM_HEIGHT 720
 #define CAM_FPS    30
 
+#define DETECT_MODEL    "models/face_detection_yunet_2023mar.tflite"
+#define RECOG_MODEL     "models/face_recognition_sface_2021dec.tflite"
+#define FACES_DIR       "faces"
+#define DETECT_WIDTH    320    /* a 16:9 frame scaled to 320 wide is 180 high, padded to 192 */
+#define DETECT_HEIGHT   192
+#define SCORE_THRESHOLD 0.7f
+#define MATCH_THRESHOLD 0.363f
+#define RECOG_INTERVAL  2.0f
+
 static char *html;
 static long  html_size;
+static int   vision_on;
 
 /* Send the whole buffer, retrying on partial sends. Returns 0 or -1 */
 static int send_all(int fd, const void *buf, size_t len) {
@@ -86,6 +97,33 @@ static void serve_stream(int client) {
     free(jpeg);
 }
 
+/* Send face results as Server-Sent Events until the client disconnects */
+static void serve_events(int client) {
+    if (!vision_on) { serve_404(client); return; }
+
+    const char *hdr =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: close\r\n\r\n";
+    if (send_all(client, hdr, strlen(hdr)) < 0) return;
+
+    char json[8192];
+    unsigned long seq = 0;
+
+    for (;;) {
+        size_t len = vision_wait_result(&seq, json, sizeof json);
+        int fail;
+        if (len == 0)
+            fail = send_all(client, ": ping\n\n", 8);   /* keep-alive when no new result */
+        else
+            fail = send_all(client, "data: ", 6) < 0 ||
+                   send_all(client, json, len) < 0 ||
+                   send_all(client, "\n\n", 2) < 0;
+        if (fail) break;
+    }
+}
+
 /* Per-client thread: read the request and route it */
 static void *client_thread(void *arg) {
     int client = (int)(intptr_t)arg;
@@ -100,6 +138,8 @@ static void *client_thread(void *arg) {
         req[n] = '\0';
         if (strncmp(req, "GET /stream", 11) == 0)
             serve_stream(client);
+        else if (strncmp(req, "GET /events", 11) == 0)
+            serve_events(client);
         else if (strncmp(req, "GET / ", 6) == 0 ||
                  strncmp(req, "GET /index.html", 15) == 0)
             serve_index(client);
@@ -127,7 +167,7 @@ static int load_html(const char *path) {
     return 0;
 }
 
-/* Load the page, start the camera, then accept clients on PORT */
+/* Load the page, start the camera and face detection, then accept clients on PORT */
 int main(int argc, char **argv) {
     if (load_html(HTML_PATH) < 0) return 1;
 
@@ -141,6 +181,19 @@ int main(int argc, char **argv) {
     };
     if (camera_start(&cam) < 0) return 1;
 
+    /* If the models are missing, face detection is off but the video still works */
+    struct vision_config vis = {
+        .detect_model    = DETECT_MODEL,
+        .recog_model     = RECOG_MODEL,
+        .faces_dir       = FACES_DIR,
+        .detect_width    = DETECT_WIDTH,
+        .detect_height   = DETECT_HEIGHT,
+        .score_threshold = SCORE_THRESHOLD,
+        .match_threshold = MATCH_THRESHOLD,
+        .recog_interval  = RECOG_INTERVAL,
+    };
+    vision_on = vision_start(&vis) == 0;
+
     int server = socket(AF_INET, SOCK_STREAM, 0);
     if (server < 0) { perror("socket"); return 1; }
     int opt = 1;
@@ -153,6 +206,8 @@ int main(int argc, char **argv) {
 
     if (bind(server, (struct sockaddr *)&addr, sizeof addr) < 0) { perror("bind"); return 1; }
     listen(server, 20);
+    printf("Server running on port %d\n", PORT);
+    fflush(stdout);
 
     while (1) {
         int client = accept(server, NULL, NULL);

@@ -13,6 +13,9 @@
     --live: #22c55e;
     --off: #ef4444;
     --accent: #3b82f6;
+    --known: #22c55e;
+    --unknown: #f59e0b;
+    --face: #3b82f6;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -52,7 +55,7 @@
   .viewer {
     width: 100%;
     max-width: 960px;
-    aspect-ratio: 4 / 3;
+    aspect-ratio: 16 / 9;
     background: #000;
     border-radius: 12px;
     overflow: hidden;
@@ -67,6 +70,13 @@
     object-fit: contain;
     display: block;
   }
+  .viewer canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+  }
   .overlay {
     position: absolute;
     inset: 0;
@@ -78,6 +88,18 @@
     background: #000;
   }
   .overlay.hidden { display: none; }
+
+  .faces {
+    width: 100%;
+    max-width: 960px;
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    font-size: 0.9rem;
+    color: var(--muted);
+  }
+  .faces strong { color: var(--text); font-weight: 600; }
 
   .controls {
     display: flex;
@@ -111,7 +133,13 @@
 
 <div class="viewer" id="viewer">
   <img id="stream" alt="Live camera stream">
+  <canvas id="boxes"></canvas>
   <div class="overlay" id="overlay">Connecting to camera…</div>
+</div>
+
+<div class="faces">
+  <span id="faceList">Face detection: connecting…</span>
+  <span id="faceRate"></span>
 </div>
 
 <div class="controls">
@@ -123,13 +151,31 @@
 
 <script>
   const STREAM_URL = "/stream";
+  const EVENTS_URL = "/events";
   const RETRY_MS = 3000;
+  const STALE_MS = 2000;
 
   const img = document.getElementById("stream");
+  const canvas = document.getElementById("boxes");
+  const ctx = canvas.getContext("2d");
+  const viewer = document.getElementById("viewer");
   const dot = document.getElementById("dot");
   const statusText = document.getElementById("statusText");
   const overlay = document.getElementById("overlay");
+  const faceList = document.getElementById("faceList");
+  const faceRate = document.getElementById("faceRate");
+  const css = getComputedStyle(document.documentElement);
+  const COLORS = {
+    known: css.getPropertyValue("--known").trim(),
+    unknown: css.getPropertyValue("--unknown").trim(),
+    face: css.getPropertyValue("--face").trim(),
+  };
+
   let retryTimer = null;
+  let eventsTimer = null;
+  let events = null;
+  let result = null;
+  let resultAt = 0;
 
   function setStatus(live, text) {
     dot.classList.toggle("live", live);
@@ -143,9 +189,96 @@
     setStatus(false, "Connecting…");
     // cache-buster so the browser opens a fresh connection
     img.src = STREAM_URL + "?t=" + Date.now();
+    connectEvents();
   }
 
-  img.addEventListener("load", () => setStatus(true, "Live"));
+  function connectEvents() {
+    clearTimeout(eventsTimer);
+    if (events) events.close();
+    events = new EventSource(EVENTS_URL);
+    events.onmessage = (e) => {
+      result = JSON.parse(e.data);
+      resultAt = Date.now();
+      showFaces();
+      draw();
+    };
+    events.onerror = () => {
+      result = null;
+      faceList.textContent = "Face detection: off or unreachable";
+      faceRate.textContent = "";
+      draw();
+      if (events.readyState === EventSource.CLOSED)
+        eventsTimer = setTimeout(connectEvents, RETRY_MS);
+    };
+  }
+
+  // a result is stale after 2 s, or after 2.5 detection intervals when detection is slower than that
+  function isStale() {
+    const interval = result && result.fps > 0 ? 1000 / result.fps : 0;
+    return Date.now() - resultAt > Math.max(STALE_MS, 2.5 * interval);
+  }
+
+  function label(f) {
+    if (!f.name) return "face " + f.score.toFixed(2);
+    if (f.name === "Unknown") return "Unknown";
+    return f.name + " " + f.sim.toFixed(2);
+  }
+
+  function color(f) {
+    if (!f.name) return COLORS.face;
+    return f.name === "Unknown" ? COLORS.unknown : COLORS.known;
+  }
+
+  function showFaces() {
+    const faces = result.faces;
+    if (faces.length === 0) {
+      faceList.textContent = "No faces";
+    } else {
+      faceList.innerHTML = "";
+      faceList.append("Faces: ");
+      faces.forEach((f, i) => {
+        const b = document.createElement("strong");
+        b.textContent = f.name || "face";
+        faceList.append(b);
+        if (i < faces.length - 1) faceList.append(", ");
+      });
+    }
+    faceRate.textContent = `${result.fps.toFixed(1)} detections/s · ${result.known} known photo(s)`;
+  }
+
+  function draw() {
+    const dpr = window.devicePixelRatio || 1;
+    const cw = viewer.clientWidth, ch = viewer.clientHeight;
+    canvas.width = Math.round(cw * dpr);
+    canvas.height = Math.round(ch * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cw, ch);
+
+    if (!result || !img.naturalWidth || isStale()) return;
+
+    // area the image actually covers inside the viewer (object-fit: contain)
+    const scale = Math.min(cw / img.naturalWidth, ch / img.naturalHeight);
+    const iw = img.naturalWidth * scale, ih = img.naturalHeight * scale;
+    const ox = (cw - iw) / 2, oy = (ch - ih) / 2;
+
+    ctx.lineWidth = 2;
+    ctx.font = "600 14px system-ui, sans-serif";
+    ctx.textBaseline = "bottom";
+    for (const f of result.faces) {
+      const x = ox + f.x * iw, y = oy + f.y * ih, w = f.w * iw, h = f.h * ih;
+      const c = color(f), text = label(f);
+      ctx.strokeStyle = c;
+      ctx.strokeRect(x, y, w, h);
+      const tw = ctx.measureText(text).width + 10;
+      const ty = y > 22 ? y : y + h + 22;
+      ctx.fillStyle = c;
+      ctx.fillRect(x - 1, ty - 20, tw, 20);
+      ctx.fillStyle = "#000";
+      ctx.fillText(text, x + 4, ty - 3);
+    }
+  }
+
+  img.addEventListener("load", () => { setStatus(true, "Live"); draw(); });
 
   img.addEventListener("error", () => {
     setStatus(false, "Camera offline or busy — retrying…");
@@ -155,14 +288,16 @@
   document.getElementById("reloadBtn").addEventListener("click", connect);
 
   document.getElementById("fsBtn").addEventListener("click", () => {
-    const el = document.getElementById("viewer");
     if (document.fullscreenElement) document.exitFullscreen();
-    else if (el.requestFullscreen) el.requestFullscreen();
+    else if (viewer.requestFullscreen) viewer.requestFullscreen();
     else alert("Fullscreen isn't supported on this browser.");
   });
 
+  new ResizeObserver(draw).observe(viewer);
+
   setInterval(() => {
     document.getElementById("clock").textContent = new Date().toLocaleString();
+    if (result && isStale()) draw();
   }, 1000);
 
   connect();
