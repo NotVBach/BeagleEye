@@ -1,0 +1,15 @@
+[Unit]
+Description=BeagleEye LAN camera
+After=network.target
+
+[Service]
+User=debian
+SupplementaryGroups=video
+WorkingDirectory=/home/debian/BeagleEye
+# Line-buffer stdout so the journal shows log lines as they happen
+ExecStart=/usr/bin/stdbuf -oL /home/debian/BeagleEye/server/server
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

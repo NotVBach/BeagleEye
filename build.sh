@@ -2,7 +2,6 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# Tried in order; the first reachable one is used.
 HOSTS=("debian@192.168.7.2" "debian@192.168.1.9")
 BBB_DIR="BeagleEye"
 BUILD_DIR="build"
@@ -48,6 +47,11 @@ scp -q www/index.html "$HOST:$BBB_DIR/www/index.html"
 ssh "$HOST" "mv -f $BBB_DIR/server/server.new $BBB_DIR/server/server"
 echo "OK"
 
-step "Running on $HOST (Ctrl+C to stop)"
-echo "Open http://${HOST#*@}:8080/"
-ssh -t "$HOST" "pkill -f '^\./server/server' || true; cd $BBB_DIR && exec ./server/server"
+step "Starting the service on $HOST"
+scp -q cmake/beagleeye.service "$HOST:beagleeye.service"
+# -t: sudo may ask for a password. pkill stops any copy started by hand.
+ssh -t "$HOST" "pkill -f '^\./server/server' || true; \
+    sudo install -m644 beagleeye.service /etc/systemd/system/ && rm beagleeye.service && \
+    sudo systemctl daemon-reload && sudo systemctl enable beagleeye && sudo systemctl restart beagleeye"
+echo "OK. Open http://${HOST#*@}:8080/"
+echo "Logs: ssh $HOST journalctl -fu beagleeye"
