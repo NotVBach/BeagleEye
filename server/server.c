@@ -66,6 +66,79 @@ static void serve_404(int client) {
     send_all(client, r, strlen(r));
 }
 
+/* Send a small response with the given status line, type and body */
+static void serve_body(int client, const char *status, const char *type, const void *body, size_t len) {
+    char header[200];
+    int hlen = snprintf(header, sizeof header,
+        "HTTP/1.1 %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: close\r\n\r\n", status, type, len);
+    if (send_all(client, header, hlen) == 0 && len)
+        send_all(client, body, len);
+}
+
+static int query_value(const char *req, const char *key, char *out, size_t size) {
+    const char *line = strchr(req, '\n');
+    const char *q    = strchr(req, '?');
+    const char *end  = q ? strchr(q, ' ') : NULL;   /* the space before "HTTP/1.1" */
+    size_t klen = strlen(key);
+    if (!q || !end || (line && end > line)) return -1;
+    for (const char *p = q + 1; p < end; p = strchr(p, '&') ? strchr(p, '&') + 1 : end) {
+        if (strncmp(p, key, klen) || p[klen] != '=') continue;
+        size_t n = strcspn(p + klen + 1, "& ");
+        if (n == 0 || n >= size || strspn(p + klen + 1, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") < n)
+            return -1;
+        memcpy(out, p + klen + 1, n);
+        out[n] = '\0';
+        return 0;
+    }
+    return -1;
+}
+
+/* Send the known faces as JSON */
+static void serve_face_list(int client) {
+    static char json[65536];
+    static pthread_mutex_t json_lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&json_lock);
+    size_t len = vision_list_faces(json, sizeof json);
+    serve_body(client, "200 OK", "application/json", len ? json : "[]", len ? len : 2);
+    pthread_mutex_unlock(&json_lock);
+}
+
+/* Rename a known face: POST /api/rename?file=new-123.jpg&name=anna */
+static void serve_rename(int client, const char *req) {
+    char file[80], name[80];
+    if (query_value(req, "file", file, sizeof file) < 0 || query_value(req, "name", name, sizeof name) < 0 ||
+        vision_rename_face(file, name) < 0)
+        serve_body(client, "400 Bad Request", "text/plain", "rename failed", 13);
+    else
+        serve_body(client, "200 OK", "text/plain", "ok", 2);
+}
+
+/* Send one photo from FACES_DIR: GET /faces/<file> */
+static void serve_face_photo(int client, const char *req) {
+    const char *name = req + strlen("GET /faces/");
+    size_t n = strcspn(name, " ?");
+    char path[128];
+    /* Plain file names only, so a request cannot reach outside the folder */
+    if (n == 0 || n > 80 || name[0] == '.' ||
+        strspn(name, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") < n) {
+        serve_404(client);
+        return;
+    }
+    snprintf(path, sizeof path, FACES_DIR "/%.*s", (int)n, name);
+    FILE *f = fopen(path, "rb");
+    if (!f) { serve_404(client); return; }
+    char buf[256 * 1024];   /* face crops are a few tens of KB */
+    size_t len = fread(buf, 1, sizeof buf, f);
+    int whole = feof(f);
+    fclose(f);
+    if (!whole) { serve_404(client); return; }
+    serve_body(client, "200 OK", "image/jpeg", buf, len);
+}
+
 /* Send camera frames as an MJPEG stream until the client disconnects */
 static void serve_stream(int client) {
     const char *hdr =
@@ -140,6 +213,12 @@ static void *client_thread(void *arg) {
             serve_stream(client);
         else if (strncmp(req, "GET /events", 11) == 0)
             serve_events(client);
+        else if (strncmp(req, "GET /api/faces", 14) == 0)
+            serve_face_list(client);
+        else if (strncmp(req, "POST /api/rename?", 17) == 0)
+            serve_rename(client, req);
+        else if (strncmp(req, "GET /faces/", 11) == 0)
+            serve_face_photo(client, req);
         else if (strncmp(req, "GET / ", 6) == 0 ||
                  strncmp(req, "GET /index.html", 15) == 0)
             serve_index(client);

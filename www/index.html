@@ -101,6 +101,15 @@
   }
   .faces strong { color: var(--text); font-weight: 600; }
 
+  .known { width: 100%; max-width: 960px; }
+  .known h2 { font-size: 1rem; margin: 0 0 8px; }
+  .known-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; }
+  .known-card { background: var(--panel); border-radius: 8px; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+  .known-card img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px; background: #000; }
+  .known-card input { width: 100%; box-sizing: border-box; padding: 6px; border-radius: 6px;
+                      border: 1px solid #2a2f3a; background: #000; color: var(--text); font-size: 0.9rem; }
+  .known-card small { color: var(--muted); overflow-wrap: anywhere; }
+
   .controls {
     display: flex;
     gap: 10px;
@@ -141,6 +150,11 @@
   <span id="faceList">Face detection: connecting…</span>
   <span id="faceRate"></span>
 </div>
+
+<section class="known">
+  <h2>Known faces</h2>
+  <div class="known-grid" id="knownGrid"></div>
+</section>
 
 <div class="controls">
   <button id="fsBtn">⛶ Fullscreen</button>
@@ -199,6 +213,7 @@
     events.onmessage = (e) => {
       result = JSON.parse(e.data);
       resultAt = Date.now();
+      if (result.known !== knownCount) loadKnown();
       showFaces();
       draw();
     };
@@ -243,7 +258,8 @@
         if (i < faces.length - 1) faceList.append(", ");
       });
     }
-    faceRate.textContent = `${result.fps.toFixed(1)} detections/s · ${result.known} known photo(s)`;
+    faceRate.textContent = `${result.fps.toFixed(1)} detections/s · inference ${result.infer_ms} ms · ` +
+      `CPU ${result.cpu >= 0 ? result.cpu + "%" : "n/a"} · ${result.known} known photo(s)`;
   }
 
   function draw() {
@@ -301,6 +317,40 @@
   }, 1000);
 
   connect();
+
+  /* Known faces: one card per photo; edit the name and press Enter to rename */
+  const knownGrid = document.getElementById("knownGrid");
+  let knownCount = -1;
+
+  async function loadKnown() {
+    let list;
+    try { list = await (await fetch("/api/faces")).json(); } catch { return; }
+    knownCount = list.length;
+    knownGrid.replaceChildren(...list.map((f) => {
+      const card = document.createElement("div");
+      card.className = "known-card";
+      const photo = document.createElement("img");
+      photo.src = "/faces/" + encodeURIComponent(f.file);
+      photo.alt = "Photo of " + f.name;
+      const input = document.createElement("input");
+      input.value = f.name;
+      input.setAttribute("aria-label", "Name for " + f.file);
+      input.title = "Letters, digits, _ and -. Press Enter to save.";
+      const note = document.createElement("small");
+      note.textContent = f.file;
+      input.addEventListener("keydown", async (e) => {
+        if (e.key !== "Enter" || input.value === f.name) return;
+        const q = new URLSearchParams({ file: f.file, name: input.value.trim() });
+        const r = await fetch("/api/rename?" + q, { method: "POST" }).catch(() => null);
+        if (r && r.ok) loadKnown();
+        else note.textContent = "Rename failed: use letters, digits, _ or -";
+      });
+      card.append(photo, input, note);
+      return card;
+    }));
+    if (!list.length) knownGrid.textContent = "No known faces yet.";
+  }
+  loadKnown();
 </script>
 </body>
 </html>

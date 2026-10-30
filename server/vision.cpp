@@ -39,10 +39,12 @@ const int    FRAME_SIDE    = 640;
 const int    MAX_FACES     = 10;
 const size_t MAX_NAME      = 64;
 const float  NMS_THRESHOLD = 0.3f;
+const float  NEW_FACE_SCORE = 0.9f;  /* detection score needed to save an unknown face */
+const float  NEW_FACE_SIZE  = 60;    /* face box width in frame pixels needed to save it */
 const int    STRIDES[]     = { 8, 16, 32 };
 const char  *HEADS[]       = { "cls", "obj", "bbox", "kps" };
 
-struct Known { std::string name; cv::Mat feature; };
+struct Known { std::string name, file; cv::Mat feature; };
 struct Track { cv::Rect2f box; float score; std::string name; float sim; double recog_at; };
 struct JpegErr { jpeg_error_mgr pub; jmp_buf jump; unsigned char *volatile buf; };
 
@@ -61,10 +63,11 @@ Net  detector, recognizer;
 bool have_recognizer;
 int  heads[4][3];    /* YuNet output tensor index per head (cls, obj, bbox, kps) and stride */
 std::vector<Known> known;
+pthread_mutex_t    known_lock = PTHREAD_MUTEX_INITIALIZER;  /* guards known against the web threads */
 
 pthread_mutex_t lock    = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t  updated = PTHREAD_COND_INITIALIZER;
-std::string     result  = "{\"fps\":0,\"known\":0,\"faces\":[]}";
+std::string     result  = "{\"fps\":0,\"cpu\":-1,\"infer_ms\":0,\"known\":0,\"faces\":[]}";
 unsigned long   result_seq;
 
 /* Seconds from a monotonic clock */
@@ -120,6 +123,38 @@ cv::Mat decode_jpeg(const unsigned char *data, size_t len, int min_side) {
     cv::Mat img = cv::Mat(h, w, CV_8UC3, err.buf).clone();
     free(err.buf);
     return img;
+}
+
+/* Write a BGR image as a JPEG file; false on error */
+bool write_jpeg(const fs::path &path, const cv::Mat &img) {
+    FILE *f = fopen(path.c_str(), "wb");
+    if (!f) return false;
+    jpeg_compress_struct cinfo;
+    JpegErr err;
+    cinfo.err = jpeg_std_error(&err.pub);
+    err.pub.error_exit = jpeg_fail;
+    if (setjmp(err.jump)) {
+        jpeg_destroy_compress(&cinfo);
+        fclose(f);
+        return false;
+    }
+    jpeg_create_compress(&cinfo);
+    jpeg_stdio_dest(&cinfo, f);
+    cinfo.image_width      = img.cols;
+    cinfo.image_height     = img.rows;
+    cinfo.input_components = 3;
+    cinfo.in_color_space   = JCS_EXT_BGR;
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, 90, TRUE);
+    jpeg_start_compress(&cinfo, TRUE);
+    cv::Mat c = img.isContinuous() ? img : img.clone();
+    while (cinfo.next_scanline < cinfo.image_height) {
+        JSAMPROW row = const_cast<unsigned char *>(c.ptr(cinfo.next_scanline));
+        jpeg_write_scanlines(&cinfo, &row, 1);
+    }
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+    return fclose(f) == 0;
 }
 
 /* Read a whole file into memory; empty on error */
@@ -380,7 +415,7 @@ void load_known_faces() {
             if (photo.empty()) { printf("Vision: cannot read %s\n", path.c_str()); continue; }
             cv::Mat feat = photo_feature(photo);
             if (feat.empty()) { printf("Vision: no face found in %s\n", path.c_str()); continue; }
-            known.push_back({ person_name(path), feat });
+            known.push_back({ person_name(path), path.filename().string(), feat });
             printf("Vision: %s <- %s\n", known.back().name.c_str(), path.filename().c_str());
         } catch (const std::exception &e) {
             printf("Vision: skipped %s (%s)\n", path.c_str(), e.what());
@@ -394,6 +429,7 @@ std::string match_face(const cv::Mat &feat, float &sim) {
     std::string name = "Unknown";
     sim = 0;
     if (feat.empty()) return name;
+    pthread_mutex_lock(&known_lock);
     for (const auto &k : known) {
         float s = (float)feat.dot(k.feature);
         if (s > sim) {
@@ -401,7 +437,49 @@ std::string match_face(const cv::Mat &feat, float &sim) {
             name = s >= match_threshold ? k.name : "Unknown";
         }
     }
+    pthread_mutex_unlock(&known_lock);
     return name;
+}
+
+/* Save an unmatched face as faces_dir/new-<time>.jpg and remember it, so the same person is saved once.
+   The crop is padded to twice the box so the detector finds the face again when the photo is reloaded;
+   the hyphen keeps person_name() from stripping the time. Rename the file to "anna.jpg" to name the person. */
+std::string save_new_face(const cv::Mat &frame, const cv::Mat &row, const cv::Mat &feat) {
+    cv::Rect box(row.at<float>(0), row.at<float>(1), row.at<float>(2), row.at<float>(3));
+    box -= cv::Point(box.width / 2, box.height / 2);
+    box += cv::Size(box.width, box.height);
+    box &= cv::Rect(0, 0, frame.cols, frame.rows);
+    if (box.empty()) return "Unknown";
+
+    char name[32];
+    snprintf(name, sizeof name, "new-%ld", (long)time(nullptr));
+    fs::path path = fs::path(faces_dir) / (std::string(name) + ".jpg");
+    std::error_code ec;
+    fs::create_directories(faces_dir, ec);
+    if (fs::exists(path, ec) || !write_jpeg(path, frame(box))) return "Unknown";
+    pthread_mutex_lock(&known_lock);
+    known.push_back({ name, path.filename().string(), feat });
+    pthread_mutex_unlock(&known_lock);
+    printf("Vision: new face saved to %s\n", path.c_str());
+    return name;
+}
+
+/* Whole-board CPU use in percent since the previous call, from /proc/stat; -1 if unreadable */
+float cpu_usage() {
+    static unsigned long long last_busy, last_total;
+    unsigned long long v[8] = {};
+    FILE *f = fopen("/proc/stat", "r");
+    if (!f) return -1;
+    int n = fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]);
+    fclose(f);
+    if (n < 4) return -1;
+    unsigned long long idle = v[3] + v[4], total = 0;
+    for (auto x : v) total += x;
+    unsigned long long busy = total - idle;
+    float pct = total > last_total ? 100.f * (busy - last_busy) / (total - last_total) : -1;
+    last_busy = busy;
+    last_total = total;
+    return pct;
 }
 
 /* Escape a string for use inside a JSON string value */
@@ -416,9 +494,10 @@ std::string json_escape(const std::string &s) {
 }
 
 /* Results as JSON; box coordinates are fractions of the frame size */
-std::string to_json(const std::vector<Track> &tracks, double fps) {
+std::string to_json(const std::vector<Track> &tracks, double fps, float cpu, double infer_ms) {
     char num[160];
-    snprintf(num, sizeof num, "{\"fps\":%.1f,\"known\":%zu,\"faces\":[", fps, known.size());
+    snprintf(num, sizeof num, "{\"fps\":%.1f,\"cpu\":%.0f,\"infer_ms\":%.0f,\"known\":%zu,\"faces\":[",
+             fps, cpu, infer_ms, known.size());
     std::string json = num;
     for (size_t i = 0; i < tracks.size(); i++) {
         const Track &t = tracks[i];
@@ -441,7 +520,8 @@ void *vision_loop(void *) {
     size_t cap = 0;
     unsigned long seq = 0;
     std::vector<Track> tracks;
-    double last = now_sec(), fps = 0;
+    double last = now_sec(), fps = 0, infer_ms = 0, cpu_at = 0;
+    float cpu = cpu_usage();
 
     for (;;) {
         size_t len = camera_wait_frame(&seq, &jpeg, &cap);
@@ -451,6 +531,7 @@ void *vision_loop(void *) {
         try {
             cv::Mat frame = decode_jpeg(jpeg, len, FRAME_SIDE);
             if (frame.empty()) continue;
+            double t0 = now_sec();
             cv::Mat faces = detect_faces(frame);
 
             for (int i = 0; i < faces.rows; i++) {
@@ -469,18 +550,22 @@ void *vision_loop(void *) {
                     if (o > best) { best = o; prev = &p; }
                 }
 
-                if (known.empty()) {
+                if (!have_recognizer) {
                     t.name = "";
                 } else if (prev && now_sec() - prev->recog_at < recog_interval) {
                     t.name = prev->name;
                     t.sim = prev->sim;
                     t.recog_at = prev->recog_at;
                 } else {
-                    t.name = match_face(face_feature(frame, row), t.sim);
+                    cv::Mat feat = face_feature(frame, row);
+                    t.name = match_face(feat, t.sim);
+                    /* Only clear, large faces: a poor first photo would not match the same person later, so they would be saved again and again */
+                    if (t.name == "Unknown" && !feat.empty() && t.score >= NEW_FACE_SCORE && row.at<float>(2) >= NEW_FACE_SIZE) t.name = save_new_face(frame, row, feat);
                     t.recog_at = now_sec();
                 }
                 found.push_back(t);
             }
+            infer_ms = (now_sec() - t0) * 1000;
         } catch (const std::exception &e) {
             fprintf(stderr, "Vision: %s\n", e.what());
             continue;
@@ -491,7 +576,8 @@ void *vision_loop(void *) {
         last = now;
         if (dt > 0) fps = fps > 0 ? 0.8 * fps + 0.2 / dt : 1.0 / dt;
 
-        std::string json = to_json(tracks, fps);
+        if (now - cpu_at >= 1) { cpu = cpu_usage(); cpu_at = now; }  /* shorter windows are too noisy */
+        std::string json = to_json(tracks, fps, cpu, infer_ms);
         pthread_mutex_lock(&lock);
         result = json;
         result_seq++;
@@ -578,4 +664,48 @@ extern "C" size_t vision_wait_result(unsigned long *seq, char *buf, size_t size)
     else memcpy(buf, result.c_str(), len + 1);
     pthread_mutex_unlock(&lock);
     return len;
+}
+
+/* JSON array of the known face photos: [{"file":"anna.jpg","name":"anna"},...] */
+extern "C" size_t vision_list_faces(char *buf, size_t size) {
+    std::string json = "[";
+    pthread_mutex_lock(&known_lock);
+    for (size_t i = 0; i < known.size(); i++)
+        json += std::string(i ? "," : "") + "{\"file\":\"" + json_escape(known[i].file) +
+                "\",\"name\":\"" + json_escape(known[i].name) + "\"}";
+    pthread_mutex_unlock(&known_lock);
+    json += "]";
+    if (json.size() >= size) return 0;
+    memcpy(buf, json.c_str(), json.size() + 1);
+    return json.size();
+}
+
+/* Rename a known photo to <name>.jpg (or <name>_2.jpg, ... if taken) so it is this person from now on */
+extern "C" int vision_rename_face(const char *file, const char *name) {
+    std::string n = name;
+    if (n.empty() || n.size() > MAX_NAME ||
+        n.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != std::string::npos)
+        return -1;
+    while (!n.empty() && n.back() == '_') n.pop_back();   /* "anna_" would read as "anna_" + number */
+    if (n.empty()) return -1;
+
+    int rc = -1;
+    pthread_mutex_lock(&known_lock);
+    for (auto &k : known) {
+        if (k.file != file) continue;   /* only files we loaded: also stops "../" paths */
+        std::error_code ec;
+        fs::path to = fs::path(faces_dir) / (n + ".jpg");
+        for (int i = 2; fs::exists(to, ec) && i < 1000; i++)
+            to = fs::path(faces_dir) / (n + "_" + std::to_string(i) + ".jpg");
+        if (fs::exists(to, ec)) break;
+        fs::rename(fs::path(faces_dir) / k.file, to, ec);
+        if (ec) break;
+        printf("Vision: renamed %s -> %s\n", k.file.c_str(), to.filename().c_str());
+        k.file = to.filename().string();
+        k.name = person_name(to);   /* same name a restart would give */
+        rc = 0;
+        break;
+    }
+    pthread_mutex_unlock(&known_lock);
+    return rc;
 }
