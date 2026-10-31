@@ -345,7 +345,17 @@
         if (r && r.ok) loadKnown();
         else note.textContent = "Rename failed: use letters, digits, _ or -";
       });
-      card.append(photo, input, note);
+      const del = document.createElement("button");
+      del.textContent = "Delete";
+      del.setAttribute("aria-label", "Delete " + f.file);
+      del.addEventListener("click", async () => {
+        if (!confirm(`Delete ${f.file}? This cannot be undone.`)) return;
+        const q = new URLSearchParams({ file: f.file });
+        const r = await fetch("/api/delete?" + q, { method: "POST" }).catch(() => null);
+        if (r && r.ok) loadKnown();
+        else note.textContent = "Delete failed";
+      });
+      card.append(photo, input, note, del);
       return card;
     }));
     if (!list.length) knownGrid.textContent = "No known faces yet.";

@@ -117,6 +117,15 @@ static void serve_rename(int client, const char *req) {
         serve_body(client, "200 OK", "text/plain", "ok", 2);
 }
 
+/* Delete a known face: POST /api/delete?file=new-123.jpg */
+static void serve_delete(int client, const char *req) {
+    char file[80];
+    if (query_value(req, "file", file, sizeof file) < 0 || vision_delete_face(file) < 0)
+        serve_body(client, "400 Bad Request", "text/plain", "delete failed", 13);
+    else
+        serve_body(client, "200 OK", "text/plain", "ok", 2);
+}
+
 /* Send one photo from FACES_DIR: GET /faces/<file> */
 static void serve_face_photo(int client, const char *req) {
     const char *name = req + strlen("GET /faces/");
@@ -217,6 +226,8 @@ static void *client_thread(void *arg) {
             serve_face_list(client);
         else if (strncmp(req, "POST /api/rename?", 17) == 0)
             serve_rename(client, req);
+        else if (strncmp(req, "POST /api/delete?", 17) == 0)
+            serve_delete(client, req);
         else if (strncmp(req, "GET /faces/", 11) == 0)
             serve_face_photo(client, req);
         else if (strncmp(req, "GET / ", 6) == 0 ||

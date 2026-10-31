@@ -709,3 +709,21 @@ extern "C" int vision_rename_face(const char *file, const char *name) {
     pthread_mutex_unlock(&known_lock);
     return rc;
 }
+
+/* Delete a known photo from disk and stop matching it */
+extern "C" int vision_delete_face(const char *file) {
+    int rc = -1;
+    pthread_mutex_lock(&known_lock);
+    for (size_t i = 0; i < known.size(); i++) {
+        if (known[i].file != file) continue;   /* only files we loaded: also stops "../" paths */
+        std::error_code ec;
+        if (fs::remove(fs::path(faces_dir) / known[i].file, ec)) {
+            printf("Vision: deleted %s\n", file);
+            known.erase(known.begin() + i);
+            rc = 0;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&known_lock);
+    return rc;
+}

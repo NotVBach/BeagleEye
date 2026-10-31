@@ -30,6 +30,9 @@ size_t vision_list_faces(char *buf, size_t size);
 /* Rename known photo `file` in faces_dir to person `name` (letters, digits, _ and -). Returns 0 or -1. */
 int vision_rename_face(const char *file, const char *name);
 
+/* Delete known photo `file` from faces_dir and stop matching it. Returns 0 or -1. */
+int vision_delete_face(const char *file);
+
 #ifdef __cplusplus
 }
 #endif
